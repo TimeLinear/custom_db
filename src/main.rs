@@ -10,6 +10,8 @@ mod engine;
 use model::DataValue;
 use engine::MyDatabase;
 
+use crate::model::MyDbError;
+
 
 fn parse_input(input: &str) -> DataValue {
     if let Ok(i) = input.parse::<i64>() {
@@ -28,14 +30,14 @@ fn parse_input(input: &str) -> DataValue {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let db = Arc::new(Mutex::new(MyDatabase::new("/database/database.db")));
+    let db = Arc::new(Mutex::new(MyDatabase::new("data_store").expect("DB 초기화 실패")));
     
     let listener = TcpListener::bind("127.0.0.1:16379").await?;
     println!("DB 서버가 127.0.0.1:16379 에서 가동 중입니다...");
 
     loop {
         let (mut socket, _) = listener.accept().await?;
-        let c_db = Arc::clone(&db);
+        let c_db: Arc<Mutex<MyDatabase>> = Arc::clone(&db);
 
         tokio::spawn(async move {
             let mut buf = [0; 1024];
@@ -54,32 +56,29 @@ async fn main() -> io::Result<()> {
                 if parts.is_empty() { continue; }
 
                 // DB 작업 수행
-                let mut db = c_db.lock().await; // 잠금 획득 or 대기
+                let mut l_db: tokio::sync::MutexGuard<MyDatabase> = c_db.lock().await; // 잠금 획득 or 대기
                 let response = match parts[0] {
                     "set" if parts.len() == 3 => {
-                        db.set(parts[1].to_string(), parse_input(parts[2])).ok();
+                        l_db.set(parts[1].to_string(), parse_input(parts[2])).ok();
                         "OK\n".to_string()
                     }
                     "get" if parts.len() == 2 => {
-                        match db.get(parts[1]) {
-                            Some(v) => {
-                                let value_str = match v {
-                                    DataValue::Text(s) => s,
-                                    DataValue::Integer(i) => i.to_string(),
-                                    DataValue::Float(f) => f.to_string(),
-                                    DataValue::Boolean(b) => b.to_string(),
-                                    DataValue::Null => "null".to_string(),
-                                };
-                                format!("\"{}\"\n", value_str)
-                            },
-                            None => "(nil)\n".to_string(),
+                        match l_db.get(parts[1]) {
+                            Ok(v) => format!("\"{:?}\"\n", v),
+                            Err(MyDbError::KeyNotFound(k)) => format!("(nil) - Key '{}' not found\n", k),
+                            Err(e) => format!("Internal Error: {}\n", e), // 치명적 에러도 서버는 죽지 않음
+                        }
+                    }
+                    "del" if parts.len() == 2 => {
+                        match l_db.delete(parts[1].to_string()) {
+                            Ok(_) => "OK\n".to_string(),
+                            Err(e) => format!("Error: {}\n", e),
                         }
                     }
                     "filter_gt" if parts.len() == 2 => {
                         if let Ok(threshold) = parts[1].parse::<i64>() {
-                            let mut db = c_db.lock().await;
                             // Integer 타입이면서 기준값보다 큰 데이터만 필터링
-                            let results = db.filter(|val| {
+                            let results = l_db.filter(|val| {
                                 if let DataValue::Integer(i) = val {
                                     *i > threshold
                                 } else {
@@ -101,8 +100,7 @@ async fn main() -> io::Result<()> {
                         }
                     }
                     "scan" if parts.len() == 3 => {
-                        let mut db = c_db.lock().await;
-                        let results = db.get_range(parts[1], parts[2]);
+                        let results = l_db.get_range(parts[1], parts[2]);
 
                         if results.is_empty() {
                             "No results in range\n".to_string()
