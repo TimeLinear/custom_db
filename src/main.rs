@@ -75,6 +75,12 @@ async fn main() -> io::Result<()> {
                             Err(e) => format!("Error: {}\n", e),
                         }
                     }
+                    "compact" => {
+                        match l_db.compact() {
+                            Ok(_) => "Compaction completed successfully\n".to_string(),
+                            Err(e) => format!("Error during compaction: {}\n", e),
+                        }
+                    }
                     "filter_gt" if parts.len() == 2 => {
                         if let Ok(threshold) = parts[1].parse::<i64>() {
                             // Integer 타입이면서 기준값보다 큰 데이터만 필터링

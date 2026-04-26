@@ -11,9 +11,10 @@ pub struct IndexEntry {
 }
 
 pub struct MyDatabase {
-    memtable: BTreeMap<String, DataValue>,
-    index: HashMap<String, (String, IndexEntry)>,
+    memtable: BTreeMap<String, DataValue>, // 메모리에 올려진 실제 데이터들
+    index: HashMap<String, (String, IndexEntry)>, // key -> (파일명, 인덱스 정보)
     data_dir: String,
+    next_seq: u64, // 다음 세그먼트 번호
 }
 
 impl MyDatabase {
@@ -21,19 +22,23 @@ impl MyDatabase {
         fs::create_dir_all(dir_path).map_err(|e| MyDbError::ConfigError(e.to_string()))?;
 
         let mut index = HashMap::new();
+        let mut max_seq = 0;
         let paths = fs::read_dir(dir_path)?;
 
-        let mut idx_files: Vec<_> = paths
+        let mut entries: Vec<_> = paths
             .filter_map(|r| r.ok())
-            .filter(|e| {
-                e.path().extension().map_or(false, |ext| ext == "idx")
-            })
             .collect();
 
-        idx_files.sort_by_key(|e| e.file_name());
+        // 파일명 순으로 정렬 (시퀀스 번호 순서 보장)
+        entries.sort_by_key(|e| e.file_name());
 
-        for entry in idx_files {
-            let idx_path = entry.path();
+        for entry in entries {
+            let path = entry.path();
+            if path.extension().map_or(true, |ext| ext != "idx") {
+                continue;
+            }
+
+            let idx_path = path;
             let file_stem = idx_path.file_stem().unwrap().to_str().unwrap().to_string();
             let data_filename = format!("{}.db", file_stem);
 
@@ -41,6 +46,13 @@ impl MyDatabase {
                 let temp_idx: HashMap<String, IndexEntry> = serde_json::from_reader(file).unwrap_or_default();
                 for (key, idx_entry) in temp_idx {
                     index.insert(key, (data_filename.clone(), idx_entry));
+                }
+            }
+
+            // 가장 높은 시퀀스 번호 파악 (data_123 -> 123)
+            if let Some(seq_str) = file_stem.strip_prefix("data_") {
+                if let Ok(seq) = seq_str.parse::<u64>() {
+                    max_seq = max_seq.max(seq);
                 }
             }
         }
@@ -51,6 +63,7 @@ impl MyDatabase {
             memtable: BTreeMap::new(),
             index,
             data_dir: dir_path.to_string(),
+            next_seq: max_seq + 1,
         })
     }
 
@@ -99,39 +112,60 @@ impl MyDatabase {
     pub fn compact(&mut self) -> io::Result<()> {
         println!("컴팩션 시작");
 
-        // 임시 파일 생성
-        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let tmp_data_path = Path::new(&self.data_dir).join(format!("compact_{}.db.tmp", timestamp));
-        let tmp_idx_path = Path::new(&self.data_dir).join(format!("compact_{}.idx.tmp", timestamp));
+        if self.index.is_empty() {
+            println!("컴팩션할 디스크 데이터가 없습니다.");
+            return Ok(());
+        }
+
+        // 새로운 세그먼트 시퀀스 번호 할당
+        let compact_seq = self.next_seq;
+        self.next_seq += 1;
+
+        let tmp_data_path = Path::new(&self.data_dir).join(format!("data_{}.db.tmp", compact_seq));
+        let tmp_idx_path = Path::new(&self.data_dir).join(format!("data_{}.idx.tmp", compact_seq));
 
         let mut tmp_data_file = File::create(&tmp_data_path)?;
         let mut new_idx_map = HashMap::new();
         let mut current_offset = 0;
 
-        // 인덱스의 모든 키 수집 및 정렬
-        let mut all_keys: Vec<String> = self.index.keys().cloned().collect();
-        all_keys.sort();
+        // 1. 파일별로 읽어야 할 키들을 그룹화 (I/O 최적화)
+        let mut file_to_keys: HashMap<String, Vec<String>> = HashMap::new();
+        for (key, (filename, _)) in &self.index {
+            file_to_keys.entry(filename.clone()).or_default().push(key.clone());
+        }
 
-        for key in all_keys {
-            if let Ok(value) = self.get(&key) {
-                // 삭제된 데이터(Tombstone)는 건너뛰기
-                if value == DataValue::Deleted {
-                    continue;
+        // 2. 파일별 순회하며 데이터 추출
+        for (filename, keys) in file_to_keys {
+            let full_path = Path::new(&self.data_dir).join(&filename);
+            let mut file = File::open(full_path)?;
+
+            for key in keys {
+                let (_, idx_entry) = &self.index[&key];
+                file.seek(SeekFrom::Start(idx_entry.offset))?;
+                
+                let mut buffer = vec![0; idx_entry.len];
+                file.read_exact(&mut buffer)?;
+                let entry: LogEntry = serde_json::from_slice(&buffer)?;
+
+                // 유효한 데이터만 새 파일에 쓰기
+                if entry.value != DataValue::Deleted {
+                    let json_line = format!("{}\n", serde_json::to_string(&entry)?);
+                    let len = json_line.len();
+                    tmp_data_file.write_all(json_line.as_bytes())?;
+                    
+                    new_idx_map.insert(key, IndexEntry { offset: current_offset, len });
+                    current_offset += len as u64;
                 }
-
-                let entry = LogEntry { key: key.clone(), value };
-                let json_line = format!("{}\n", serde_json::to_string(&entry)?);
-                let len = json_line.len();
-
-                tmp_data_file.write_all(json_line.as_bytes())?;
-                new_idx_map.insert(key, IndexEntry { offset: current_offset, len });
-                current_offset += len as u64;
             }
         }
 
         // 임시 인덱스 파일 저장
         let tmp_idx_file = File::create(&tmp_idx_path)?;
         serde_json::to_writer(tmp_idx_file, &new_idx_map)?;
+
+        if new_idx_map.is_empty() {
+            println!("유효한 데이터가 없어 세그먼트가 생성되지 않았습니다.");
+        }
 
         // 기존 파일 목록 확보
         let old_files: Vec<String> = self.index.values()
@@ -172,65 +206,48 @@ impl MyDatabase {
     where
         F: Fn(&DataValue) -> bool, // 값(DataValue)을 검사하는 함수를 인자로 받음
     {
-        let mut latest_data = HashMap::new();
+        // 모든 키(메모리 + 인덱스)를 수집하여 유니크한 최신 데이터 추출
+        let mut all_keys: std::collections::HashSet<String> = self.index.keys().cloned().collect();
+        all_keys.extend(self.memtable.keys().cloned());
 
-        // 1. 디렉토리 내의 모든 .db 파일들을 순회하며 전수 검사
-        if let Ok(entries) = fs::read_dir(&self.data_dir) {
-            let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            paths.sort_by_key(|e| e.file_name());
-
-            for entry in paths {
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "db") {
-                    if let Ok(file) = File::open(path) {
-                        let reader = BufReader::new(file);
-                        for line in reader.lines().filter_map(|l| l.ok()) {
-                            if let Ok(log_entry) = serde_json::from_str::<LogEntry>(&line) {
-                                latest_data.insert(log_entry.key, log_entry.value);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. 메모리(memtable) 데이터로 덮어쓰기 (가장 최신)
-        for (key, value) in &self.memtable {
-            latest_data.insert(key.clone(), value.clone());
-        }
-
-        // 3. 필터링 및 결과 생성
-        latest_data.into_iter()
-            .filter(|(_, val)| *val != DataValue::Deleted && predicate(val))
-            .map(|(key, value)| LogEntry { key, value })
+        all_keys.into_iter()
+            .filter_map(|key| {
+                self.get(&key).ok().map(|value| LogEntry { key, value })
+            })
+            .filter(|entry| entry.value != DataValue::Deleted && predicate(&entry.value))
             .collect()
     }
 
     pub fn get_range(&mut self, start: &str, end: &str) -> Vec<LogEntry> {
-        let mut results = Vec::new();
+        let mut all_keys: std::collections::BTreeSet<String> = self.memtable.keys()
+            .filter(|k| k.as_str() >= start && k.as_str() <= end)
+            .cloned()
+            .collect();
 
-        for (key, value) in self.memtable.range(start.to_string()..=end.to_string()) {
-            if *value != DataValue::Deleted {
-                results.push(LogEntry {
-                    key: key.clone(),
-                    value: value.clone(),
-                });
+        all_keys.extend(
+            self.index.keys()
+                .filter(|k| k.as_str() >= start && k.as_str() <= end)
+                .cloned()
+        );
+
+        let mut results = Vec::new();
+        for key in all_keys {
+            if let Ok(value) = self.get(&key) {
+                if value != DataValue::Deleted {
+                    results.push(LogEntry { key, value });
+                }
             }
         }
-
         results
     }
 
     fn flush_to_disk(&mut self) -> io::Result<()> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let seq = self.next_seq;
+        self.next_seq += 1;
 
-        let file_prefix = format!("data_{}", timestamp);
+        let file_prefix = format!("data_{}", seq);
         let data_path = Path::new(&self.data_dir).join(format!("{}.db", file_prefix));
         let idx_path = Path::new(&self.data_dir).join(format!("{}.idx", file_prefix));
-
 
         let mut data_file = File::create(&data_path)?;
         let mut idx_map = HashMap::new();
